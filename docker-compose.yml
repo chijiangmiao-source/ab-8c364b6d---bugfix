@@ -1,0 +1,52 @@
+services:
+  api:
+    build:
+      context: ./api
+    image: ash-audit-api:latest
+    environment:
+      # Container-internal port (nginx and verify talk to this); the host
+      # mapping is configurable separately through API_PORT below.
+      PORT: "8000"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  web:
+    build:
+      context: ./web
+    image: ash-audit-web:latest
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # One-shot verification: checks canonical fraction weights, outside-hull
+  # infeasibility, tie classification, code tests, build and API smoke.
+  # Its container exit code is the verification result:
+  #   docker compose build verify && docker compose run --rm verify
+  verify:
+    build:
+      context: .
+      dockerfile: verify/Dockerfile
+    image: ash-audit-verify:latest
+    environment:
+      API_BASE: http://api:8000
+      WEB_BASE: http://web:80
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    restart: "no"
