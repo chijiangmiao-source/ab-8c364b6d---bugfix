@@ -177,3 +177,125 @@ def test_weights_sum_to_one_and_reproduce_target():
         assert sum(w) == 1
         for r in range(3):
             assert sum(w[i] * pts[i].t[r] for i in range(4)) == tgt[r]
+
+
+# ------------------------------------- Cartesian ties across same-ray lanes
+# Three rays out of the origin with 2 / 3 / 4 co-linear members: the target
+# is the origin, so every optimum picks one member per ray (2*3*4 = 24).
+RAY_X = {"Z1": (2, 0, 0), "A1": (1, 0, 0)}
+RAY_Y = {"Z2": (0, 3, 0), "A2": (0, 1, 0), "B2": (0, 2, 0)}
+RAY_D = {"Z3": (-4, -4, 0), "A3": (-1, -1, 0),
+         "B3": (-2, -2, 0), "C3": (-3, -3, 0)}
+ORIGIN = (Fraction(0), Fraction(0), Fraction(0))
+
+
+def _three_ray_batch():
+    coords = {**RAY_X, **RAY_Y, **RAY_D}
+    return [em(k, v) for k, v in coords.items()]
+
+
+def _assert_recomputes(ems, res):
+    by_id = {e.id: e for e in ems}
+    for sol in res.tied:
+        assert len(sol.ids) == len(set(sol.ids))
+        assert all(w > 0 for w in sol.weights)
+        assert sum(sol.weights) == 1
+        for r in range(3):
+            got = sum(w * by_id[i].t[r] for i, w in zip(sol.ids, sol.weights))
+            assert got == ORIGIN[r], (sol.ids, r, got)
+
+
+def test_three_rays_produce_full_cartesian_24_ties():
+    ems = _three_ray_batch()
+    res = audit(ems, ORIGIN)
+    assert res.feasible
+    assert res.solution.cost == 3
+    assert len(res.tied) == 24
+
+    id_sets = {s.ids for s in res.tied}
+    assert len(id_sets) == 24  # 24 distinct explanations
+    for ids in id_sets:
+        assert sum(i in RAY_X for i in ids) == 1
+        assert sum(i in RAY_Y for i in ids) == 1
+        assert sum(i in RAY_D for i in ids) == 1
+
+    # canonical explanation: lexicographically smallest, equal thirds
+    assert res.solution.ids == ("A1", "A2", "A3")
+    assert res.solution.weights == (Fraction(1, 3),) * 3
+
+    # every member of every lane participates in some, never in all ties
+    assert set(res.classification) == {e.id for e in ems}
+    assert all(v == "partial" for v in res.classification.values())
+
+    _assert_recomputes(ems, res)
+
+
+def test_cartesian_ties_independent_of_entry_order():
+    ems = _three_ray_batch()
+    baseline = audit(ems, ORIGIN)
+    expected = (
+        baseline.solution.ids,
+        baseline.solution.weights,
+        [(s.ids, s.weights) for s in baseline.tied],
+        tuple(sorted(baseline.classification.items())),
+    )
+    for perm in (
+        list(reversed(ems)),
+        [ems[i] for i in (0, 3, 6, 1, 4, 7, 2, 5, 8)],
+        [ems[i] for i in (8, 0, 7, 1, 6, 2, 5, 3, 4)],
+    ):
+        res = audit(perm, ORIGIN)
+        assert len(res.tied) == 24
+        assert (res.solution.ids, res.solution.weights) == expected[:2]
+        assert [(s.ids, s.weights) for s in res.tied] == expected[2]
+        assert tuple(sorted(res.classification.items())) == expected[3]
+
+
+def test_same_ray_members_get_their_own_exact_weights():
+    # Distances differ per lane member, so weights must be re-solved for
+    # every combination rather than copied from a representative.
+    ems = [
+        em("Z1", (2, 0, 0)), em("A1", (1, 0, 0)),
+        em("A2", (0, 1, 0)), em("B2", (0, 2, 0)),
+        em("A3", (-1, -1, 0)),
+    ]
+    res = audit(ems, ORIGIN)
+    weights_by_ids = {s.ids: s.weights for s in res.tied}
+    assert weights_by_ids[("A1", "A2", "A3")] == (
+        Fraction(1, 3), Fraction(1, 3), Fraction(1, 3))
+    assert weights_by_ids[("A1", "A3", "B2")] == (
+        Fraction(2, 5), Fraction(2, 5), Fraction(1, 5))
+    assert weights_by_ids[("A2", "A3", "Z1")] == (
+        Fraction(2, 5), Fraction(2, 5), Fraction(1, 5))
+    assert weights_by_ids[("A3", "B2", "Z1")] == (
+        Fraction(1, 2), Fraction(1, 4), Fraction(1, 4))
+    _assert_recomputes(ems, res)
+
+
+def test_singleton_lane_member_is_always_rest_partial():
+    # X and diagonal lanes have one member each; the Y lane has two.
+    ems = [
+        em("A1", (1, 0, 0)),
+        em("A2", (0, 1, 0)), em("B2", (0, 2, 0)),
+        em("A3", (-1, -1, 0)),
+    ]
+    res = audit(ems, ORIGIN)
+    assert len(res.tied) == 2
+    assert res.classification["A1"] == "always"
+    assert res.classification["A3"] == "always"
+    assert res.classification["A2"] == "partial"
+    assert res.classification["B2"] == "partial"
+
+
+def test_pricier_same_ray_member_never_appears():
+    # Making B2 pricier removes it from the optimum even though the lane
+    # still offers Z2/A2 at cost 1: 2*2*4 = 16 cost-3 ties.
+    ems = _three_ray_batch()
+    ems = [e if e.id != "B2" else em("B2", (0, 2, 0), 2) for e in ems]
+    res = audit(ems, ORIGIN)
+    assert len(res.tied) == 16
+    assert all("B2" not in s.ids for s in res.tied)
+    assert all(s.cost == 3 for s in res.tied)
+    assert res.classification["B2"] == "never"
+    assert res.classification["A2"] == "partial"
+    _assert_recomputes(ems, res)

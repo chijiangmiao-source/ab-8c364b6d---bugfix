@@ -21,8 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from fractions import Fraction
-from itertools import combinations
-from typing import Iterable
+from itertools import combinations, product
 
 # Three tracers -> ambient space R^3; at most 4 endmembers are ever needed.
 MAX_SUPPORT = 4
@@ -46,9 +45,18 @@ class Solution:
 
 @dataclass(frozen=True)
 class DirectionClass:
+    """Endmembers lying on one ray from the target.
+
+    ``cheapest`` holds the members attaining the class minimum ``cost``
+    (sorted by id); only they can participate in a cost-tied optimum: a
+    solution using a pricier member of the same ray could swap in a
+    cheaper one (rescaling its weight) and keep support size while
+    lowering cost.
+    """
+
     direction: tuple[Fraction, Fraction, Fraction]
-    members: tuple[Endmember, ...]
     cost: int
+    cheapest: tuple[Endmember, ...]
 
 
 @dataclass
@@ -151,48 +159,60 @@ def _direction_classes(
 
     classes: list[DirectionClass] = []
     for direction, members in grouped.items():
-        min_cost = min(member.cost for member in members)
-        cheapest = tuple(member for member in members if member.cost == min_cost)
+        ordered = tuple(sorted(members, key=lambda member: member.id))
+        min_cost = min(member.cost for member in ordered)
+        cheapest = tuple(m for m in ordered if m.cost == min_cost)
         classes.append(
-            DirectionClass(direction=direction, members=cheapest, cost=min_cost)
+            DirectionClass(
+                direction=direction,
+                cost=min_cost,
+                cheapest=cheapest,
+            )
         )
+    # Stable, input-independent order; candidates are deduped and sorted
+    # lexicographically by id before they leave the solver.
+    classes.sort(key=lambda c: c.direction)
     return classes
 
 
-def _expand_direction_solution(
-    groups: tuple[DirectionClass, ...], weights: tuple[Fraction, ...]
+def _enumerate_support_solutions(
+    groups: tuple[DirectionClass, ...],
+    target: tuple[Fraction, Fraction, Fraction],
 ) -> list[Solution]:
-    solutions: list[Solution] = []
-    shared_width = min(len(group.members) for group in groups)
-    for variant_index in range(shared_width):
-        chosen = [group.members[variant_index] for group in groups]
-        ordered = sorted(zip(chosen, weights), key=lambda item: item[0].id)
-        solutions.append(
-            Solution(
-                ids=tuple(member.id for member, _ in ordered),
-                weights=tuple(weight for _, weight in ordered),
-                cost=sum(group.cost for group in groups),
-            )
+    """Every strictly-positive combination over distinct target-rays.
+
+    For each selection of distinct direction classes, each class may
+    contribute any of its cheapest members (members at different
+    distances along the same ray carry *different* weights, so weights
+    are re-solved exactly for every choice).  Duplicate affine
+    representations (e.g. collinear members making two selections
+    coincide) are collapsed by their id tuple.
+    """
+    found: dict[tuple[str, ...], Solution] = {}
+    member_lanes = [group.cheapest for group in groups]
+    for chosen in product(*member_lanes):
+        w = solve_weights([member.t for member in chosen], target)
+        if w is None:
+            continue
+        ordered = sorted(zip(chosen, w), key=lambda item: item[0].id)
+        ids = tuple(member.id for member, _ in ordered)
+        cost = sum(member.cost for member in chosen)
+        found[ids] = Solution(
+            ids=ids,
+            weights=tuple(weight for _, weight in ordered),
+            cost=cost,
         )
-    return solutions
+    return list(found.values())
 
 
-def _classify_direction_members(
-    endmembers: list[Endmember],
-    direction_classes: list[DirectionClass],
-    solutions: list[Solution],
+def _classify(
+    endmembers: list[Endmember], solutions: list[Solution]
 ) -> dict[str, str]:
-    lane_count = min(len(group.members) for group in direction_classes)
-    admitted = {
-        member.id
-        for group in direction_classes
-        for member in group.members[:lane_count]
-    }
+    """always / partial / never across all (min-support, min-cost) ties."""
     counts: dict[str, int] = {}
     for solution in solutions:
         for endmember_id in solution.ids:
-            if endmember_id in admitted:
-                counts[endmember_id] = counts.get(endmember_id, 0) + 1
+            counts[endmember_id] = counts.get(endmember_id, 0) + 1
 
     solution_count = len(solutions)
     return {
@@ -210,35 +230,27 @@ def _classify_direction_members(
 def audit(
     endmembers: list[Endmember], target: tuple[Fraction, Fraction, Fraction]
 ) -> AuditResult:
-    best: list[Solution] = []
     direction_classes = _direction_classes(endmembers, target)
 
+    best: list[Solution] = []
     for size in range(1, MAX_SUPPORT + 1):
         candidates: list[Solution] = []
         for combo in combinations(direction_classes, size):
-            representatives = [group.members[0] for group in combo]
-            w = solve_weights([member.t for member in representatives], target)
-            if w is None:
-                continue
-            candidates.extend(_expand_direction_solution(combo, w))
+            candidates.extend(_enumerate_support_solutions(combo, target))
         if candidates:
             min_cost = min(s.cost for s in candidates)
             best = sorted(
                 (s for s in candidates if s.cost == min_cost),
-                key=lambda s: tuple(s.ids),
+                key=lambda s: s.ids,
             )
             break
 
     if not best:
         return AuditResult(feasible=False)
 
-    classification = _classify_direction_members(
-        endmembers, direction_classes, best
-    )
-
     return AuditResult(
         feasible=True,
         solution=best[0],
         tied=best,
-        classification=classification,
+        classification=_classify(endmembers, best),
     )
