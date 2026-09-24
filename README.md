@@ -45,8 +45,11 @@ docker compose run --rm verify
 2. 规范分数权重（四面体内点 → 四个 `1/4`；四位小数目标 `0.125` → `7/8 + 1/8`）；
 3. 凸包外目标 `feasible=false` 且无解；
 4. 同优归类（等代价两条对角线 → 四个端元皆 partial；唯一解 → always/never）；
-5. 构建产物（Web 容器返回构建后的 `index.html` 且 JS bundle 可访问）；
-6. API 冒烟（直连与经 Web 代理的 `/health`、`POST /api/audit`）。
+5. 同向射线批次（2×3×4 笛卡尔积 → 24 组同优解；规范解三个 `1/3`；
+   九个端元全部 partial；用响应中的精确分数逐一复算三个示踪值；
+   改变录入顺序结果不变；直连与经 Web 代理各覆盖一次）；
+6. 构建产物（Web 容器返回构建后的 `index.html` 且 JS bundle 可访问）；
+7. API 冒烟（直连与经 Web 代理的 `/health`、`POST /api/audit`）。
 
 ## HTTP 接口
 

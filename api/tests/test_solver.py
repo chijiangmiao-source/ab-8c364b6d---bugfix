@@ -177,3 +177,107 @@ def test_weights_sum_to_one_and_reproduce_target():
         assert sum(w) == 1
         for r in range(3):
             assert sum(w[i] * pts[i].t[r] for i in range(4)) == tgt[r]
+
+
+# --------------------------------------------- collinear-ray audit batch
+ASH_BATCH_COORDS = {
+    "Z1": (2, 0, 0), "Z2": (0, 3, 0), "Z3": (-4, -4, 0),
+    "A1": (1, 0, 0), "A2": (0, 1, 0), "B2": (0, 2, 0),
+    "A3": (-1, -1, 0), "B3": (-2, -2, 0), "C3": (-3, -3, 0),
+}
+ASH_ORDER = ["Z1", "Z2", "Z3", "A1", "A2", "B2", "A3", "B3", "C3"]
+ASH_RAY_X = {"Z1", "A1"}
+ASH_RAY_Y = {"Z2", "A2", "B2"}
+ASH_RAY_D = {"Z3", "A3", "B3", "C3"}
+
+
+def _ash_audit(order=ASH_ORDER):
+    return audit(
+        [em(i, ASH_BATCH_COORDS[i]) for i in order],
+        (Fraction(0), Fraction(0), Fraction(0)),
+    )
+
+
+def test_ash_batch_canonical_solution():
+    res = _ash_audit()
+    assert res.feasible
+    assert res.solution.ids == ("A1", "A2", "A3")
+    assert res.solution.weights == (Fraction(1, 3), Fraction(1, 3), Fraction(1, 3))
+    assert res.solution.cost == 3
+
+
+def test_ash_batch_has_24_distinct_tied_explanations():
+    res = _ash_audit()
+    assert len(res.tied) == 24
+    assert len({s.ids for s in res.tied}) == 24
+    # one endmember per co-directional ray in every explanation
+    for sol in res.tied:
+        assert len(sol.ids) == 3
+        assert sum(i in ASH_RAY_X for i in sol.ids) == 1
+        assert sum(i in ASH_RAY_Y for i in sol.ids) == 1
+        assert sum(i in ASH_RAY_D for i in sol.ids) == 1
+        assert sol.cost == 3
+
+
+def test_ash_batch_every_tied_solution_is_exact_and_positive():
+    res = _ash_audit()
+    for sol in res.tied:
+        assert len(sol.weights) == 3
+        assert all(w > 0 for w in sol.weights)
+        assert sum(sol.weights) == 1
+        for r in range(3):
+            assert sum(w * ASH_BATCH_COORDS[i][r]
+                       for i, w in zip(sol.ids, sol.weights)) == 0
+
+
+def test_ash_batch_all_endmembers_partial():
+    res = _ash_audit()
+    assert res.classification == {i: "partial" for i in ASH_BATCH_COORDS}
+
+
+def test_ash_batch_invariant_to_entry_order():
+    shuffled = ["C3", "B3", "A3", "B2", "A2", "A1", "Z3", "Z2", "Z1"]
+    res = _ash_audit(shuffled)
+    assert res.solution.ids == ("A1", "A2", "A3")
+    assert res.solution.weights == (Fraction(1, 3),) * 3
+    assert len(res.tied) == 24
+    assert len({s.ids for s in res.tied}) == 24
+    assert res.classification == {i: "partial" for i in ASH_BATCH_COORDS}
+
+
+def test_ash_batch_distances_give_expected_weights():
+    # the farthest members Z1/Z2/Z3 reproduce the 6/13, 4/13, 3/13 balance
+    res = _ash_audit()
+    z = next(s for s in res.tied if set(s.ids) == {"Z1", "Z2", "Z3"})
+    by_id = dict(zip(z.ids, z.weights))
+    assert by_id == {"Z1": Fraction(6, 13), "Z2": Fraction(4, 13),
+                     "Z3": Fraction(3, 13)}
+
+
+def test_collinear_ray_alternatives_combine_as_cartesian_product():
+    # two members on +x, two on -x around the origin: 2 x 2 = 4 ties
+    res = audit(
+        [em("A1", (1, 0, 0)), em("Z1", (2, 0, 0)),
+         em("A2", (-1, 0, 0)), em("Z2", (-2, 0, 0)),
+         em("E", (9, 9, 9))],
+        (Fraction(0), Fraction(0), Fraction(0)),
+    )
+    assert [s.ids for s in res.tied] == [
+        ("A1", "A2"), ("A1", "Z2"), ("A2", "Z1"), ("Z1", "Z2"),
+    ]
+    assert res.classification["E"] == "never"
+    coords = {"A1": (1, 0, 0), "Z1": (2, 0, 0),
+              "A2": (-1, 0, 0), "Z2": (-2, 0, 0)}
+    expected_weights = {
+        ("A1", "A2"): (Fraction(1, 2), Fraction(1, 2)),
+        ("A1", "Z2"): (Fraction(2, 3), Fraction(1, 3)),
+        ("A2", "Z1"): (Fraction(2, 3), Fraction(1, 3)),
+        ("Z1", "Z2"): (Fraction(1, 2), Fraction(1, 2)),
+    }
+    for sol in res.tied:
+        assert sol.weights == expected_weights[sol.ids]
+        assert all(w > 0 for w in sol.weights)
+        assert sum(sol.weights) == 1
+        for r in range(3):
+            assert sum(w * coords[i][r]
+                       for i, w in zip(sol.ids, sol.weights)) == 0

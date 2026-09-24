@@ -7,8 +7,10 @@ Runs every required audit and exits non-zero on the first failed group:
   2. canonical rational weights (exact fraction strings)
   3. outside-convex-hull infeasibility
   4. tie classification (always / partial / never)
-  5. build artefacts (web container serves the production bundle)
-  6. API smoke (direct + through the web proxy)
+  5. collinear-ray acceptance batch (24 cartesian-product ties,
+     canonical thirds, all partial, exact tracer recomputation)
+  6. build artefacts (web container serves the production bundle)
+  7. API smoke (direct + through the web proxy)
 
 Usage:  verify.py [api_base] [web_base]
 """
@@ -22,6 +24,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from fractions import Fraction
 
 API = os.environ.get("API_BASE", "http://api:8000")
 WEB = os.environ.get("WEB_BASE", "http://web:80")
@@ -89,6 +92,27 @@ TETRA = [
     {"id": "C", "t0": "0", "t1": "4", "t2": "0", "cost": "1"},
     {"id": "D", "t0": "0", "t1": "0", "t2": "4", "cost": "1"},
 ]
+
+# Collinear-ray acceptance batch: two +x, three +y and four (-x,-y)
+# endmembers around the zero target, all with review cost 1.
+ASH_BATCH = [
+    {"id": "Z1", "t0": "2", "t1": "0", "t2": "0", "cost": "1"},
+    {"id": "Z2", "t0": "0", "t1": "3", "t2": "0", "cost": "1"},
+    {"id": "Z3", "t0": "-4", "t1": "-4", "t2": "0", "cost": "1"},
+    {"id": "A1", "t0": "1", "t1": "0", "t2": "0", "cost": "1"},
+    {"id": "A2", "t0": "0", "t1": "1", "t2": "0", "cost": "1"},
+    {"id": "B2", "t0": "0", "t1": "2", "t2": "0", "cost": "1"},
+    {"id": "A3", "t0": "-1", "t1": "-1", "t2": "0", "cost": "1"},
+    {"id": "B3", "t0": "-2", "t1": "-2", "t2": "0", "cost": "1"},
+    {"id": "C3", "t0": "-3", "t1": "-3", "t2": "0", "cost": "1"},
+]
+ASH_ORDER = ["Z1", "Z2", "Z3", "A1", "A2", "B2", "A3", "B3", "C3"]
+ASH_RAYS = [
+    {"Z1", "A1"}, {"Z2", "A2", "B2"}, {"Z3", "A3", "B3", "C3"},
+]
+ASH_COORDS = {
+    e["id"]: (int(e["t0"]), int(e["t1"]), int(e["t2"])) for e in ASH_BATCH
+}
 
 
 # ----------------------------------------------- 2. canonical fraction weights
@@ -162,7 +186,93 @@ def check_classification() -> None:
     )
 
 
-# ------------------------------------------------------ 5. build artefacts
+# ----------------------------- 5. collinear-ray acceptance batch
+def _ash_batch_by_order(order):
+    by_id = {e["id"]: e for e in ASH_BATCH}
+    return [by_id[i] for i in order]
+
+
+def _validate_ash_body(body: dict) -> tuple[bool, str]:
+    """Validate every contract point of the collinear-ray batch."""
+    if not body.get("feasible") or body.get("errors"):
+        return False, f"unexpected response: {json.dumps(body)[:300]}"
+    if body.get("tie_count") != 24 or len(body.get("tied", [])) != 24:
+        return False, f"tie_count={body.get('tie_count')}"
+
+    sol = body.get("solution") or {}
+    canonical = [(w["id"], w["fraction"]) for w in sol.get("weights", [])]
+    if sol.get("ids") != ["A1", "A2", "A3"] or canonical != [
+        ("A1", "1/3"), ("A2", "1/3"), ("A3", "1/3")
+    ] or sol.get("cost") != 3:
+        return False, f"bad canonical solution: {json.dumps(sol)[:300]}"
+
+    keys = set()
+    for tied in body["tied"]:
+        ids = tied.get("ids", [])
+        key = tuple(ids)
+        if key in keys:
+            return False, f"duplicate explanation {key}"
+        keys.add(key)
+        if len(ids) != 3 or not all(len(r & set(ids)) == 1 for r in ASH_RAYS):
+            return False, f"bad ray composition: {ids}"
+        if tied.get("cost") != 3:
+            return False, f"bad cost on {ids}"
+        weights = {w["id"]: w for w in tied.get("weights", [])}
+        if set(weights) != set(ids):
+            return False, f"weight/id mismatch on {ids}"
+        fracs = {}
+        for i in ids:
+            w = weights[i]
+            if w["numerator"] <= 0 or w["denominator"] <= 0:
+                return False, f"non-positive weight on {ids}: {w}"
+            frac = Fraction(w["numerator"], w["denominator"])
+            # the rendered fraction string must carry the exact same value
+            if Fraction(w["fraction"]) != frac:
+                return False, f"fraction string mismatch on {ids}: {w}"
+            fracs[i] = frac
+        if sum(fracs.values()) != 1:
+            return False, f"weights do not sum to 1 on {ids}: {fracs}"
+        # recompute all three tracers from the response's exact fractions
+        for r in range(3):
+            tracer = sum(fracs[i] * ASH_COORDS[i][r] for i in ids)
+            if tracer != 0:
+                return False, f"tracer {r} recomputes to {tracer} on {ids}"
+
+    cls = body.get("classification", {})
+    if set(cls) != set(ASH_ORDER) or not all(v == "partial" for v in cls.values()):
+        return False, f"bad classification: {json.dumps(cls)[:300]}"
+    return True, ""
+
+
+def check_ash_batch() -> None:
+    # entry order must not change canonical solution, tie total or classes
+    orders = {
+        "specified order": ASH_ORDER,
+        "reversed order": list(reversed(ASH_ORDER)),
+        "shuffled order": ["A1", "B2", "C3", "Z1", "A2", "B3", "Z2", "A3", "Z3"],
+    }
+    for label, order in orders.items():
+        _, body = post(f"{API}/api/audit",
+                       {"endmembers": _ash_batch_by_order(order),
+                        "target": ["0", "0", "0"]})
+        ok, detail = _validate_ash_body(body)
+        check(f"collinear-ray batch: 24 ties / thirds / partial ({label})",
+              ok, detail)
+
+    # same batch through the web proxy proves the real HTTP path end-to-end
+    try:
+        status, body = post(f"{WEB}/api/audit",
+                            {"endmembers": _ash_batch_by_order(ASH_ORDER),
+                             "target": ["0", "0", "0"]})
+        ok, detail = (status == 200, f"http {status}")
+        if ok:
+            ok, detail = _validate_ash_body(body)
+    except Exception as exc:  # noqa: BLE001
+        ok, detail = False, str(exc)
+    check("collinear-ray batch through web proxy (24 exact ties)", ok, detail)
+
+
+# ------------------------------------------------------ 6. build artefacts
 def check_web_build() -> None:
     try:
         status, html = get(f"{WEB}/")
@@ -186,7 +296,7 @@ def check_web_build() -> None:
         check("built JS bundle asset reachable", False, str(exc))
 
 
-# ---------------------------------------------------------------- 6. smoke
+# ---------------------------------------------------------------- 7. smoke
 def check_smoke() -> None:
     try:
         s, body = get(f"{API}/health")
@@ -224,6 +334,7 @@ def main() -> int:
     check_canonical_weights()
     check_outside_hull()
     check_classification()
+    check_ash_batch()
     check_web_build()
     check_smoke()
 
